@@ -42,7 +42,7 @@ from typing import (
 )
 from langchain_anthropic import ChatAnthropic
 from langchain_mistralai import ChatMistralAI
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI # 导入 ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langchain_ibm import ChatWatsonx
@@ -238,10 +238,12 @@ def get_llm_model(provider: str, **kwargs):
                 api_key=api_key,
             )
     elif provider == "google":
+        # 使用 LangChain 的 ChatGoogleGenerativeAI 處理 Gemini 模型
+        # api_key 會自動從 kwargs 中獲取（如果設置了）或從環境變量 GOOGLE_API_KEY 中獲取
         return ChatGoogleGenerativeAI(
-            model=kwargs.get("model_name", "gemini-2.0-flash-exp"),
+            model=kwargs.get("model_name", "gemini-2.0-flash-exp"), # 確保模型名稱正確
             temperature=kwargs.get("temperature", 0.0),
-            api_key=api_key,
+            api_key=kwargs.get("api_key") # 直接傳遞從 get_llm_model 函數入口獲取的 api_key
         )
     elif provider == "ollama":
         if not kwargs.get("base_url", ""):
