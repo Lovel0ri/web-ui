@@ -42,14 +42,19 @@ from typing import (
 )
 from langchain_anthropic import ChatAnthropic
 from langchain_mistralai import ChatMistralAI
-from langchain_google_genai import ChatGoogleGenerativeAI # 导入 ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langchain_ibm import ChatWatsonx
 from langchain_aws import ChatBedrock
-from pydantic import SecretStr
+from pydantic import SecretStr, Field
+
+# Import requests and json for直接调用 Gemini API
+import requests
+import json
 
 from src.utils import config
+from src.utils import utils  # 假设 utils 中有 encode_image 等函数
 
 
 class DeepSeekR1ChatOpenAI(ChatOpenAI):
@@ -149,80 +154,168 @@ class DeepSeekR1ChatOllama(ChatOllama):
         return AIMessage(content=content, reasoning_content=reasoning_content)
 
 
+class CustomChatGoogleGenerativeAI(ChatGoogleGenerativeAI):
+    """
+    Custom Gemini Chat 模型，用于直接调用 Google Generative API（支持 text + image）。
+    修正了 URL 里 model 前缀可能出现的重复 “models/models/...” 问题。
+    """
+
+    api_key: SecretStr = Field(default_factory=lambda: SecretStr(os.getenv("GOOGLE_API_KEY", "")))
+
+    def __init__(self, *, model: str = "gemini-2.0-flash-exp", temperature: float = 0.0, api_key: Optional[str] = None, **kwargs: Any) -> None:
+        """
+        :param model: 要调用的 Gemini 模型名称（可以是 "gemini-2.0-flash" 或者 "models/gemini-2.0-flash"）。
+        :param temperature: 调用时的 temperature。
+        :param api_key: 可选，如果传入则覆盖环境变量中读取到的 api_key。
+        """
+        if api_key is not None:
+            kwargs["api_key"] = SecretStr(api_key)
+        super().__init__(model=model, temperature=temperature, **kwargs)
+        # ChatGoogleGenerativeAI 父类会把 model 存到 self.model，把 temperature 存到 self.temperature，把 api_key 存到 self.api_key
+
+    def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """同步调用 Gemini API 并返回 ChatResult。"""
+
+        # 1. 先把 messages 转成 Gemini 要求的 payload 格式
+        gemini_messages = []
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                parts = []
+                if isinstance(msg.content, str):
+                    parts.append({"text": msg.content})
+                elif isinstance(msg.content, list):
+                    for item in msg.content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            parts.append({"text": item["text"]})
+                        elif isinstance(item, dict) and item.get("type") == "image_url":
+                            image_url = item["image_url"]["url"]
+                            if image_url.startswith("data:image/"):
+                                mime_type = image_url.split(";")[0].split(":")[1]
+                                base64_data = image_url.split(",")[1]
+                                parts.append({"inline_data": {"mime_type": mime_type, "data": base64_data}})
+                gemini_messages.append({"role": "user", "parts": parts})
+            elif isinstance(msg, AIMessage):
+                gemini_messages.append({"role": "model", "parts": [{"text": msg.content}]})
+            elif isinstance(msg, SystemMessage):
+                # 如果已有用户消息就插到第一条的 parts 里，否则当成新的 user 消息
+                if gemini_messages and gemini_messages[0]["role"] == "user":
+                    gemini_messages[0]["parts"].insert(0, {"text": msg.content + "\n"})
+                else:
+                    gemini_messages.insert(0, {"role": "user", "parts": [{"text": msg.content}]})
+
+        # 2. 修正 model_name_for_url：如果 self.model 已经以 "models/" 开头，就直接用；否则手动拼 "models/{self.model}"
+        if self.model.startswith("models/"):
+            model_name_for_url = self.model
+        else:
+            model_name_for_url = f"models/{self.model}"
+
+        # 3. 构造最终的 URL（确认只有一个 "models/" 前缀）
+        api_url = (
+            f"https://generativelanguage.googleapis.com/v1beta/{model_name_for_url}:generateContent"
+            f"?key={self.api_key.get_secret_value()}"
+        )
+
+        payload = {
+            "contents": gemini_messages,
+            "generationConfig": {
+                "temperature": self.temperature,
+                "maxOutputTokens": kwargs.get("max_tokens", 2048),
+            },
+        }
+
+        try:
+            response = requests.post(
+                api_url,
+                headers={"Content-Type": "application/json"},
+                json=payload
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            text_content = result["candidates"][0]["content"]["parts"][0]["text"]
+            chat_generation = ChatGeneration(message=AIMessage(content=text_content))
+            return ChatResult(generations=[chat_generation])
+
+        except Exception as e:
+            raise ValueError(
+                f"Error calling Gemini API: {e}\n"
+                f"URL: {api_url}\n"
+                f"Response: {response.text if 'response' in locals() else 'No response'}"
+            )
+
+    async def _agenerate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """异步调用，内部直接调用同步方法。"""
+        return self._generate(messages, stop, run_manager, **kwargs)
+
+
+
 def get_llm_model(provider: str, **kwargs):
     """
-    Get LLM model
-    :param provider: LLM provider
-    :param kwargs:
-    :return:
+    根据 provider 名称返回对应的 LLM 实例。
+    :param provider: LLM 提供商，比如 "google"、"openai"、"anthropic" 等
+    :param kwargs: 包含 model_name、temperature、api_key、base_url 等
+    :return: 对应的 Chat 模型实例
     """
+    api_key = None  # 用来存储最终确认的 api_key
+
     if provider not in ["ollama", "bedrock"]:
         env_var = f"{provider.upper()}_API_KEY"
         api_key = kwargs.get("api_key", "") or os.getenv(env_var, "")
         if not api_key:
             provider_display = config.PROVIDER_DISPLAY_NAMES.get(provider, provider.upper())
-            error_msg = f"💥 {provider_display} API key not found! 🔑 Please set the `{env_var}` environment variable or provide it in the UI."
+            error_msg = f"💥 {provider_display} API key not found! 🔑 请设置环境变量 `{env_var}` 或者在 UI 中填写它。"
             raise ValueError(error_msg)
-        kwargs["api_key"] = api_key
 
     if provider == "anthropic":
-        if not kwargs.get("base_url", ""):
-            base_url = "https://api.anthropic.com"
-        else:
-            base_url = kwargs.get("base_url")
-
+        base_url = kwargs.get("base_url", "https://api.anthropic.com")
         return ChatAnthropic(
             model=kwargs.get("model_name", "claude-3-5-sonnet-20241022"),
             temperature=kwargs.get("temperature", 0.0),
             base_url=base_url,
             api_key=api_key,
         )
-    elif provider == 'mistral':
-        if not kwargs.get("base_url", ""):
-            base_url = os.getenv("MISTRAL_ENDPOINT", "https://api.mistral.ai/v1")
-        else:
-            base_url = kwargs.get("base_url")
-        if not kwargs.get("api_key", ""):
-            api_key = os.getenv("MISTRAL_API_KEY", "")
-        else:
-            api_key = kwargs.get("api_key")
 
+    elif provider == 'mistral':
+        base_url = kwargs.get("base_url", os.getenv("MISTRAL_ENDPOINT", "https://api.mistral.ai/v1"))
         return ChatMistralAI(
             model=kwargs.get("model_name", "mistral-large-latest"),
             temperature=kwargs.get("temperature", 0.0),
             base_url=base_url,
             api_key=api_key,
         )
-    elif provider == "openai":
-        if not kwargs.get("base_url", ""):
-            base_url = os.getenv("OPENAI_ENDPOINT", "https://api.openai.com/v1")
-        else:
-            base_url = kwargs.get("base_url")
 
+    elif provider == "openai":
+        base_url = kwargs.get("base_url", os.getenv("OPENAI_ENDPOINT", "https://api.openai.com/v1"))
         return ChatOpenAI(
             model=kwargs.get("model_name", "gpt-4o"),
             temperature=kwargs.get("temperature", 0.0),
             base_url=base_url,
             api_key=api_key,
         )
-    elif provider == "grok":
-        if not kwargs.get("base_url", ""):
-            base_url = os.getenv("GROK_ENDPOINT", "https://api.x.ai/v1")
-        else:
-            base_url = kwargs.get("base_url")
 
+    elif provider == "grok":
+        base_url = kwargs.get("base_url", os.getenv("GROK_ENDPOINT", "https://api.x.ai/v1"))
         return ChatOpenAI(
             model=kwargs.get("model_name", "grok-3"),
             temperature=kwargs.get("temperature", 0.0),
             base_url=base_url,
             api_key=api_key,
         )
-    elif provider == "deepseek":
-        if not kwargs.get("base_url", ""):
-            base_url = os.getenv("DEEPSEEK_ENDPOINT", "")
-        else:
-            base_url = kwargs.get("base_url")
 
+    elif provider == "deepseek":
+        base_url = kwargs.get("base_url", os.getenv("DEEPSEEK_ENDPOINT", ""))
         if kwargs.get("model_name", "deepseek-chat") == "deepseek-reasoner":
             return DeepSeekR1ChatOpenAI(
                 model=kwargs.get("model_name", "deepseek-reasoner"),
@@ -237,20 +330,17 @@ def get_llm_model(provider: str, **kwargs):
                 base_url=base_url,
                 api_key=api_key,
             )
-    elif provider == "google":
-        # 使用 LangChain 的 ChatGoogleGenerativeAI 處理 Gemini 模型
-        # api_key 會自動從 kwargs 中獲取（如果設置了）或從環境變量 GOOGLE_API_KEY 中獲取
-        return ChatGoogleGenerativeAI(
-            model=kwargs.get("model_name", "gemini-2.0-flash-exp"), # 確保模型名稱正確
-            temperature=kwargs.get("temperature", 0.0),
-            api_key=kwargs.get("api_key") # 直接傳遞從 get_llm_model 函數入口獲取的 api_key
-        )
-    elif provider == "ollama":
-        if not kwargs.get("base_url", ""):
-            base_url = os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434")
-        else:
-            base_url = kwargs.get("base_url")
 
+    elif provider == "google":
+        # 注意这里传入的是 model（而不是 model_name），因为父类 ChatGoogleGenerativeAI 构造函数接受的是 model 参数。
+        return CustomChatGoogleGenerativeAI(
+            model=kwargs.get("model_name", "gemini-2.0-flash-exp"),
+            temperature=kwargs.get("temperature", 0.0),
+            api_key=api_key,
+        )
+
+    elif provider == "ollama":
+        base_url = kwargs.get("base_url", os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434"))
         if "deepseek-r1" in kwargs.get("model_name", "qwen2.5:7b"):
             return DeepSeekR1ChatOllama(
                 model=kwargs.get("model_name", "deepseek-r1:14b"),
@@ -266,12 +356,10 @@ def get_llm_model(provider: str, **kwargs):
                 num_predict=kwargs.get("num_predict", 1024),
                 base_url=base_url,
             )
+
     elif provider == "azure_openai":
-        if not kwargs.get("base_url", ""):
-            base_url = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-        else:
-            base_url = kwargs.get("base_url")
-        api_version = kwargs.get("api_version", "") or os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+        base_url = kwargs.get("base_url", os.getenv("AZURE_OPENAI_ENDPOINT", ""))
+        api_version = kwargs.get("api_version", os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"))
         return AzureChatOpenAI(
             model=kwargs.get("model_name", "gpt-4o"),
             temperature=kwargs.get("temperature", 0.0),
@@ -279,28 +367,22 @@ def get_llm_model(provider: str, **kwargs):
             azure_endpoint=base_url,
             api_key=api_key,
         )
-    elif provider == "alibaba":
-        if not kwargs.get("base_url", ""):
-            base_url = os.getenv("ALIBABA_ENDPOINT", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-        else:
-            base_url = kwargs.get("base_url")
 
+    elif provider == "alibaba":
+        base_url = kwargs.get("base_url", os.getenv("ALIBABA_ENDPOINT", "https://dashscope.aliyuncs.com/compatible-mode/v1"))
         return ChatOpenAI(
             model=kwargs.get("model_name", "qwen-plus"),
             temperature=kwargs.get("temperature", 0.0),
             base_url=base_url,
             api_key=api_key,
         )
+
     elif provider == "ibm":
         parameters = {
             "temperature": kwargs.get("temperature", 0.0),
             "max_tokens": kwargs.get("num_ctx", 32000)
         }
-        if not kwargs.get("base_url", ""):
-            base_url = os.getenv("IBM_ENDPOINT", "https://us-south.ml.cloud.ibm.com")
-        else:
-            base_url = kwargs.get("base_url")
-
+        base_url = kwargs.get("base_url", os.getenv("IBM_ENDPOINT", "https://us-south.ml.cloud.ibm.com"))
         return ChatWatsonx(
             model_id=kwargs.get("model_name", "ibm/granite-vision-3.1-2b-preview"),
             url=base_url,
@@ -308,13 +390,15 @@ def get_llm_model(provider: str, **kwargs):
             apikey=os.getenv("IBM_API_KEY"),
             params=parameters
         )
+
     elif provider == "moonshot":
         return ChatOpenAI(
             model=kwargs.get("model_name", "moonshot-v1-32k-vision-preview"),
             temperature=kwargs.get("temperature", 0.0),
             base_url=os.getenv("MOONSHOT_ENDPOINT"),
-            api_key=os.getenv("MOONSHOT_API_KEY"),
+            api_key=api_key,
         )
+
     elif provider == "unbound":
         return ChatOpenAI(
             model=kwargs.get("model_name", "gpt-4o-mini"),
@@ -322,35 +406,24 @@ def get_llm_model(provider: str, **kwargs):
             base_url=os.getenv("UNBOUND_ENDPOINT", "https://api.getunbound.ai"),
             api_key=api_key,
         )
+
     elif provider == "siliconflow":
-        if not kwargs.get("api_key", ""):
-            api_key = os.getenv("SiliconFLOW_API_KEY", "")
-        else:
-            api_key = kwargs.get("api_key")
-        if not kwargs.get("base_url", ""):
-            base_url = os.getenv("SiliconFLOW_ENDPOINT", "")
-        else:
-            base_url = kwargs.get("base_url")
+        base_url = kwargs.get("base_url", os.getenv("SiliconFLOW_ENDPOINT", ""))
         return ChatOpenAI(
             api_key=api_key,
             base_url=base_url,
             model_name=kwargs.get("model_name", "Qwen/QwQ-32B"),
             temperature=kwargs.get("temperature", 0.0),
         )
+
     elif provider == "modelscope":
-        if not kwargs.get("api_key", ""):
-            api_key = os.getenv("MODELSCOPE_API_KEY", "")
-        else:
-            api_key = kwargs.get("api_key")
-        if not kwargs.get("base_url", ""):
-            base_url = os.getenv("MODELSCOPE_ENDPOINT", "")
-        else:
-            base_url = kwargs.get("base_url")
+        base_url = kwargs.get("base_url", os.getenv("MODELSCOPE_ENDPOINT", ""))
         return ChatOpenAI(
             api_key=api_key,
             base_url=base_url,
             model_name=kwargs.get("model_name", "Qwen/QwQ-32B"),
             temperature=kwargs.get("temperature", 0.0),
         )
+
     else:
         raise ValueError(f"Unsupported provider: {provider}")
